@@ -9,3 +9,4 @@ evidently_*.html
 predictions.csv
 run_id.txt
 .DS_Store
+mlflow.db
