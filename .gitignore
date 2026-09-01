@@ -1,0 +1,11 @@
+mlruns/
+mlartifacts/
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+evidently_*.html
+predictions.csv
+run_id.txt
+.DS_Store

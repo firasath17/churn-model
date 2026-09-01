@@ -1,0 +1,157 @@
+name: ML CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      simulate_drift:
+        description: "Regenerate current.csv with simulated drift"
+        type: boolean
+        default: false
+
+jobs:
+  # ---------------------------------------------------------------
+  # Job 1: Gate on input data quality before spending compute on training
+  # ---------------------------------------------------------------
+  validate-data:
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.check.outcome == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: (optional) simulate drifted input data
+        if: ${{ inputs.simulate_drift == true }}
+        run: DRIFT=1 python src/generate_data.py
+
+      - name: Ensure sample data exists
+        run: |
+          if [ ! -f data/reference.csv ]; then
+            python src/generate_data.py
+          fi
+
+      - name: Check for data drift (Evidently)
+        id: check
+        run: python src/validate_data.py
+
+      - name: Upload data drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidently-data-drift-report
+          path: evidently_data_drift_report.html
+
+  # ---------------------------------------------------------------
+  # Job 2: Train, log to MLflow, then gate on prediction quality/drift
+  # ---------------------------------------------------------------
+  train-and-validate-predictions:
+    needs: validate-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Train model & log to MLflow
+        run: python src/train.py
+
+      - name: Check for prediction drift (Evidently)
+        run: python src/validate_predictions.py
+
+      - name: Upload prediction drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidently-prediction-drift-report
+          path: evidently_prediction_drift_report.html
+
+      - name: Upload MLflow run + predictions
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-run
+          path: |
+            mlruns/
+            run_id.txt
+            predictions.csv
+
+  # ---------------------------------------------------------------
+  # Job 3: Register (and conditionally promote) the model — main only
+  # ---------------------------------------------------------------
+  register-model:
+    needs: train-and-validate-predictions
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Download MLflow run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mlflow-run
+
+      - name: Register model in MLflow Model Registry
+        run: python src/register_model.py
+
+      - name: Persist updated MLflow registry state
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlruns-registered
+          path: mlruns/
+
+  # ---------------------------------------------------------------
+  # Job 4: Mock deploy — stands in for "build image / push to endpoint"
+  # ---------------------------------------------------------------
+  deploy:
+    needs: register-model
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download registered MLflow state
+        uses: actions/download-artifact@v4
+        with:
+          name: mlruns-registered
+          path: mlruns/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install mlflow
+      - name: "Deploy: build + push serving image (mock)"
+        run: |
+          python -c "
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          mlflow.set_tracking_uri('file:./mlruns')
+          client = MlflowClient()
+          versions = client.get_latest_versions('churn-model', stages=['Production'])
+          if versions:
+              v = versions[0]
+              print(f'Deploying churn-model version {v.version} (run_id={v.run_id})')
+              print('docker build -t churn-model:latest .')
+              print('docker push registry.example.com/churn-model:latest')
+              print('kubectl rollout restart deployment/churn-model-service')
+          else:
+              print('No Production version found — skipping deploy.')
+          "
