@@ -119,7 +119,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mlruns-registered
-          path: mlruns/
+          path: |
+                mlruns/
                 mlflow.db
 
   # ---------------------------------------------------------------
